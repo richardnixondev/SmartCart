@@ -10,11 +10,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 from decimal import Decimal, InvalidOperation
 
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import Page
+from playwright.async_api import Page, Response
 
 from src.scrapers.base import (
     BaseScraper,
@@ -46,7 +47,7 @@ CATEGORY_PATHS = [
 ]
 
 # Special offers page (rendered with JS, needs Playwright)
-SPECIAL_OFFERS_URL = f"{BASE_URL}/special-offers"
+SPECIAL_OFFERS_URL = f"{BASE_URL}/specials"
 
 
 class AldiScraper(BaseScraper):
@@ -69,7 +70,7 @@ class AldiScraper(BaseScraper):
     # ------------------------------------------------------------------
     async def scrape_category(self, category_url: str) -> list[RawProduct]:
         # Special offers page needs Playwright
-        if "special-offers" in category_url:
+        if "/specials" in category_url:
             return await self._scrape_special_offers(category_url)
 
         # Standard category pages — try httpx first
@@ -255,6 +256,128 @@ class AldiScraper(BaseScraper):
         return products
 
     # ------------------------------------------------------------------
+    # SAP Commerce OCC API interception
+    # ------------------------------------------------------------------
+    async def _intercept_api(self, page: Page, url: str) -> list[dict]:
+        """Load a page while intercepting SAP Commerce OCC API responses."""
+        api_products: list[dict] = []
+
+        async def handle_response(response: Response) -> None:
+            resp_url = response.url
+            if "/occ/" in resp_url or "/rest/" in resp_url:
+                try:
+                    content_type = response.headers.get("content-type", "")
+                    if "application/json" not in content_type:
+                        return
+                    data = await response.json()
+                    if isinstance(data, dict):
+                        products = data.get("products", [])
+                        if isinstance(products, list) and products:
+                            api_products.extend(products)
+                except Exception:
+                    pass
+
+        page.on("response", handle_response)
+        await page.goto(url, wait_until="networkidle", timeout=60_000)
+        return api_products
+
+    def _parse_occ_product(self, item: dict) -> RawProduct | None:
+        """Parse a product from SAP Commerce OCC API response."""
+        code = item.get("code", "")
+        name = item.get("name", "")
+        if not code or not name:
+            return None
+
+        price_data = item.get("price", {})
+        price_val = price_data.get("value")
+        if price_val is None:
+            return None
+
+        try:
+            price = Decimal(str(price_val))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+
+        if price == 0:
+            return None
+
+        # Promo / was-price
+        promo_price = None
+        promo_label = None
+        was_price_data = item.get("wasPrice", {})
+        if was_price_data and was_price_data.get("value") is not None:
+            try:
+                promo_price = price  # current price is the promo
+                price = Decimal(str(was_price_data["value"]))
+                promo_label = item.get("promotionText") or "Special Offer"
+            except (InvalidOperation, TypeError, ValueError):
+                promo_price = None
+                promo_label = None
+
+        # Unit price
+        unit_price = None
+        unit = None
+        unit_price_data = item.get("basePrice") or item.get("unitPrice")
+        if isinstance(unit_price_data, dict):
+            try:
+                unit_price = Decimal(str(unit_price_data.get("value", "")))
+            except (InvalidOperation, TypeError, ValueError):
+                pass
+            unit = unit_price_data.get("unit", unit_price_data.get("currencyIso"))
+
+        # Unit size from name
+        unit_size = None
+        size_match = re.search(
+            r"(\d+(?:\.\d+)?)\s*(ml|l|g|kg|cl|pk|pack)\b", name, re.IGNORECASE
+        )
+        if size_match:
+            try:
+                unit_size = Decimal(size_match.group(1))
+                unit = unit or size_match.group(2).lower()
+            except (InvalidOperation, ValueError):
+                pass
+
+        # Image
+        image_url = None
+        images = item.get("images", [])
+        if isinstance(images, list) and images:
+            for img in images:
+                if isinstance(img, dict) and img.get("url"):
+                    image_url = img["url"]
+                    if image_url.startswith("//"):
+                        image_url = f"https:{image_url}"
+                    elif image_url.startswith("/"):
+                        image_url = f"{BASE_URL}{image_url}"
+                    break
+
+        # Product URL
+        product_url = item.get("url", "")
+        if product_url and not product_url.startswith("http"):
+            product_url = f"{BASE_URL}{product_url}"
+
+        # Brand
+        brand = None
+        brand_data = item.get("brand")
+        if isinstance(brand_data, dict):
+            brand = brand_data.get("name")
+        elif isinstance(brand_data, str):
+            brand = brand_data
+
+        return RawProduct(
+            store_sku=str(code),
+            name=name.strip(),
+            price=price,
+            promo_price=promo_price,
+            promo_label=promo_label,
+            unit_price=unit_price,
+            unit=unit,
+            unit_size=unit_size,
+            brand=brand,
+            image_url=image_url or None,
+            product_url=product_url or None,
+        )
+
+    # ------------------------------------------------------------------
     # Playwright-based scraping (fallback for standard pages)
     # ------------------------------------------------------------------
     async def _scrape_with_playwright(self, category_url: str) -> list[RawProduct]:
@@ -265,15 +388,31 @@ class AldiScraper(BaseScraper):
         try:
             page = await context.new_page()
             logger.info("[aldi] Playwright loading %s", category_url)
-            await page.goto(category_url, wait_until="domcontentloaded", timeout=60_000)
+
+            # Try to intercept OCC API responses while loading the page
+            api_products = await self._intercept_api(page, category_url)
             await asyncio.sleep(3)
 
             await self._dismiss_overlays(page)
             await self._scroll_page(page)
 
-            html = await page.content()
-            soup = BeautifulSoup(html, "html.parser")
-            products = self._parse_html(soup, category_url)
+            # Parse products from intercepted API data first
+            if api_products:
+                logger.info("[aldi] Intercepted %d OCC API products", len(api_products))
+                for item in api_products:
+                    try:
+                        product = self._parse_occ_product(item)
+                        if product:
+                            products.append(product)
+                    except Exception:
+                        logger.debug("[aldi] Failed to parse OCC product", exc_info=True)
+
+            # Fall back to DOM scraping if API interception yielded nothing
+            if not products:
+                logger.info("[aldi] Falling back to DOM scraping for %s", category_url)
+                html = await page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                products = self._parse_html(soup, category_url)
 
         finally:
             await context.close()
@@ -286,69 +425,87 @@ class AldiScraper(BaseScraper):
     # Special offers scraping (always Playwright)
     # ------------------------------------------------------------------
     async def _scrape_special_offers(self, url: str) -> list[RawProduct]:
-        """Scrape the Aldi special-offers page (JS-rendered)."""
+        """Scrape the Aldi specials page (JS-rendered)."""
         products: list[RawProduct] = []
 
         pw, browser, context = await self._get_browser_context(headless=True)
         try:
             page = await context.new_page()
             logger.info("[aldi] Loading special offers %s", url)
-            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+            # Try to intercept OCC API responses while loading the page
+            api_products = await self._intercept_api(page, url)
             await asyncio.sleep(3)
 
             await self._dismiss_overlays(page)
             await self._scroll_page(page, scrolls=8)
 
-            # Special offer tiles
-            tiles = page.locator(
-                "div[class*='SpecialBuy'], "
-                "div[class*='product-tile'], "
-                "div[data-qa='special-buy-tile'], "
-                "article[class*='product']"
-            )
-            count = await tiles.count()
-            logger.info("[aldi] Found %d special offer tiles", count)
+            # Parse products from intercepted API data first
+            if api_products:
+                logger.info("[aldi] Intercepted %d OCC API special offer products", len(api_products))
+                for item in api_products:
+                    try:
+                        product = self._parse_occ_product(item)
+                        if product:
+                            # Override promo label for special offers
+                            product.promo_label = product.promo_label or "Special Offer"
+                            products.append(product)
+                    except Exception:
+                        logger.debug("[aldi] Failed to parse OCC special offer product", exc_info=True)
 
-            for i in range(count):
-                try:
-                    tile = tiles.nth(i)
+            # Fall back to DOM scraping if API interception yielded nothing
+            if not products:
+                logger.info("[aldi] Falling back to DOM scraping for specials")
+                # Special offer tiles
+                tiles = page.locator(
+                    "div[class*='SpecialBuy'], "
+                    "div[class*='product-tile'], "
+                    "div[data-qa='special-buy-tile'], "
+                    "article[class*='product']"
+                )
+                count = await tiles.count()
+                logger.info("[aldi] Found %d special offer tiles", count)
 
-                    name_el = tile.locator("h4, h3, a[class*='Title'], p[class*='title']")
-                    name = ""
-                    if await name_el.count() > 0:
-                        name = (await name_el.first.inner_text()).strip()
-                    if not name:
-                        continue
+                for i in range(count):
+                    try:
+                        tile = tiles.nth(i)
 
-                    price_el = tile.locator("span[class*='price'], span[class*='Price']")
-                    price_text = ""
-                    if await price_el.count() > 0:
-                        price_text = await price_el.first.inner_text()
-                    price = self._parse_price(price_text)
-                    if price is None or price == 0:
-                        continue
+                        name_el = tile.locator("h4, h3, a[class*='Title'], p[class*='title']")
+                        name = ""
+                        if await name_el.count() > 0:
+                            name = (await name_el.first.inner_text()).strip()
+                        if not name:
+                            continue
 
-                    sku = f"aldi-offer-{hash(name) % 1000000}"
+                        price_el = tile.locator("span[class*='price'], span[class*='Price']")
+                        price_text = ""
+                        if await price_el.count() > 0:
+                            price_text = await price_el.first.inner_text()
+                        price = self._parse_price(price_text)
+                        if price is None or price == 0:
+                            continue
 
-                    # Image
-                    image_url = None
-                    img_el = tile.locator("img")
-                    if await img_el.count() > 0:
-                        image_url = await img_el.first.get_attribute("src")
-                        if image_url and not image_url.startswith("http"):
-                            image_url = f"{BASE_URL}{image_url}"
+                        sku = f"aldi-offer-{hash(name) % 1000000}"
 
-                    products.append(
-                        RawProduct(
-                            store_sku=sku,
-                            name=name,
-                            price=price,
-                            promo_label="Special Offer",
-                            image_url=image_url,
+                        # Image
+                        image_url = None
+                        img_el = tile.locator("img")
+                        if await img_el.count() > 0:
+                            image_url = await img_el.first.get_attribute("src")
+                            if image_url and not image_url.startswith("http"):
+                                image_url = f"{BASE_URL}{image_url}"
+
+                        products.append(
+                            RawProduct(
+                                store_sku=sku,
+                                name=name,
+                                price=price,
+                                promo_label="Special Offer",
+                                image_url=image_url,
+                            )
                         )
-                    )
-                except Exception:
-                    logger.debug("[aldi] Failed to parse special offer tile %d", i, exc_info=True)
+                    except Exception:
+                        logger.debug("[aldi] Failed to parse special offer tile %d", i, exc_info=True)
 
         finally:
             await context.close()
@@ -404,14 +561,37 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s - %(message)s",
     )
-    scraper = AldiScraper()
-    result = await scraper.run()
-    print(f"\nDone: {result.status}")
-    print(f"Products scraped: {len(result.products)}")
-    if result.errors:
-        print(f"Errors ({len(result.errors)}):")
-        for err in result.errors:
-            print(f"  - {err}")
+
+    dry_run = "--dry-run" in sys.argv
+
+    if dry_run:
+        # Dry-run mode: scrape categories and print products without hitting the DB
+        scraper = AldiScraper()
+        category_urls = await scraper.get_category_urls()
+        all_products: list[RawProduct] = []
+        for url in category_urls:
+            try:
+                products = await scraper.scrape_category(url)
+                all_products.extend(products)
+                print(f"[dry-run] {url} -> {len(products)} products")
+            except Exception as exc:
+                print(f"[dry-run] {url} -> ERROR: {exc}")
+            await random_delay(1.0, 3.0)
+
+        print(f"\n[dry-run] Total products scraped: {len(all_products)}")
+        for p in all_products[:20]:
+            print(f"  {p.store_sku:>12s}  {str(p.price):>8s}  {p.name}")
+        if len(all_products) > 20:
+            print(f"  ... and {len(all_products) - 20} more")
+    else:
+        scraper = AldiScraper()
+        result = await scraper.run()
+        print(f"\nDone: {result.status}")
+        print(f"Products scraped: {len(result.products)}")
+        if result.errors:
+            print(f"Errors ({len(result.errors)}):")
+            for err in result.errors:
+                print(f"  - {err}")
 
 
 if __name__ == "__main__":

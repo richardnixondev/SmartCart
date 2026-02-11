@@ -12,6 +12,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from playwright.async_api import async_playwright, BrowserContext
+from playwright_stealth import Stealth
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -326,9 +327,15 @@ class BaseScraper(ABC):
     @staticmethod
     async def _get_browser_context(
         headless: bool = True,
+        block_resources: bool = True,
         **extra_context_kwargs,
     ) -> tuple:
         """Create and return ``(playwright, browser, context)``.
+
+        Args:
+            headless: Run in headless mode.
+            block_resources: Block images/fonts to speed up scraping.
+                Disable for sites with strict WAF (e.g. Tesco/Akamai).
 
         Caller is responsible for closing them via::
 
@@ -337,7 +344,15 @@ class BaseScraper(ABC):
             await pw.stop()
         """
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch(headless=headless)
+
+        # Apply stealth patches to bypass bot detection (Akamai, etc.)
+        stealth = Stealth(navigator_platform_override="MacIntel")
+        stealth.hook_playwright_context(pw)
+
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         context = await browser.new_context(
             user_agent=random_user_agent(),
             viewport={"width": 1366, "height": 768},
@@ -345,9 +360,9 @@ class BaseScraper(ABC):
             timezone_id="Europe/Dublin",
             **extra_context_kwargs,
         )
-        # Block unnecessary resources to speed up scraping
-        await context.route(
-            "**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot}",
-            lambda route: route.abort(),
-        )
+        if block_resources:
+            await context.route(
+                "**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot}",
+                lambda route: route.abort(),
+            )
         return pw, browser, context

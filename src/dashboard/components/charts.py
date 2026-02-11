@@ -22,13 +22,17 @@ _DEFAULT_COLOUR_SEQUENCE = list(STORE_COLOURS.values())
 
 
 def _colour_map(stores: list[str]) -> dict[str, str]:
-    """Return a colour mapping, falling back to the palette for unknown stores."""
+    """Return a colour mapping, using partial matching and falling back to the palette."""
     palette_iter = iter(_DEFAULT_COLOUR_SEQUENCE)
     mapping: dict[str, str] = {}
     for s in stores:
-        if s in STORE_COLOURS:
-            mapping[s] = STORE_COLOURS[s]
-        else:
+        matched = False
+        for key, val in STORE_COLOURS.items():
+            if key.lower() in s.lower():
+                mapping[s] = val
+                matched = True
+                break
+        if not matched:
             mapping[s] = next(palette_iter, "#888888")
     return mapping
 

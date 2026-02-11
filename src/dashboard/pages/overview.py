@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+import pandas as pd
 import streamlit as st
 
 from src.core.config import settings
-from src.dashboard.components.charts import battle_pie_chart
 
 API = settings.api_base_url
 
@@ -27,12 +27,22 @@ def _fetch_stats() -> dict[str, Any]:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _fetch_battle(category_id: int | None = None) -> dict[str, Any]:
-    params: dict[str, Any] = {}
-    if category_id is not None:
-        params["category_id"] = category_id
+def _fetch_products(page: int = 1, limit: int = 50, search: str = "") -> dict[str, Any]:
+    params: dict[str, Any] = {"page": page, "limit": limit}
+    if search:
+        params["search"] = search
     try:
-        resp = httpx.get(f"{API}/api/battle", params=params, timeout=10)
+        resp = httpx.get(f"{API}/api/products", params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError:
+        return {"items": [], "total": 0}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_battle() -> dict[str, Any]:
+    try:
+        resp = httpx.get(f"{API}/api/battle", timeout=10)
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPError:
@@ -42,11 +52,10 @@ def _fetch_battle(category_id: int | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Page content
 # ---------------------------------------------------------------------------
-st.title("\U0001f4ca Overview")
-st.caption("Key performance indicators and today's highlights.")
+st.title("Overview")
+st.caption("Key performance indicators and product catalogue.")
 
 stats = _fetch_stats()
-battle = _fetch_battle()
 
 if not stats:
     st.error(
@@ -56,7 +65,7 @@ if not stats:
     st.stop()
 
 # ---- KPI cards -----------------------------------------------------------
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+kpi1, kpi2, kpi3 = st.columns(3)
 
 kpi1.metric(
     label="Products Tracked",
@@ -70,88 +79,120 @@ kpi3.metric(
     label="Price Records",
     value=f"{stats.get('total_price_records', 0):,}",
 )
-kpi4.metric(
-    label="Last Scrape",
-    value=stats.get("last_scrape_time", "N/A"),
-)
 
 st.divider()
 
-# ---- Cheapest store of the day -------------------------------------------
-cheapest_store = stats.get("cheapest_store")
-if cheapest_store:
-    st.subheader("Cheapest Store Today")
-    cs_col1, cs_col2 = st.columns([1, 3])
-    with cs_col1:
-        st.markdown(
-            f"<div style='text-align:center;padding:1rem;background:#f0f2f6;"
-            f"border-radius:0.5rem;'>"
-            f"<h2 style='margin:0;'>{cheapest_store.get('name', 'N/A')}</h2>"
-            f"<p style='margin:0;color:grey;'>avg. \u20ac{cheapest_store.get('avg_price', 0):.2f}</p>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with cs_col2:
-        st.markdown(
-            f"Based on the average price across all tracked products today, "
-            f"**{cheapest_store.get('name', 'N/A')}** offers the best overall value."
+# ---- Average Price by Store ----------------------------------------------
+avg_by_store = stats.get("avg_prices_by_store", [])
+if avg_by_store:
+    st.subheader("Average Price by Store")
+    store_cols = st.columns(len(avg_by_store))
+    for idx, entry in enumerate(avg_by_store):
+        store_info = entry.get("store", {})
+        store_name = store_info.get("name", "Unknown")
+        avg_price = entry.get("avg_price", "0")
+        store_cols[idx].metric(
+            label=store_name,
+            value=f"\u20ac{float(avg_price):.2f}",
         )
     st.divider()
 
-# ---- Price battle pie chart + Top 5 biggest differences ------------------
-left_col, right_col = st.columns(2)
+# ---- Battle summary (if multiple stores) ---------------------------------
+battle = _fetch_battle()
+battle_results = battle.get("results", [])
+stores_with_wins = [r for r in battle_results if r.get("wins", 0) > 0]
 
-with left_col:
+if stores_with_wins:
+    from src.dashboard.components.charts import battle_pie_chart
+
     st.subheader("Cheapest Store Breakdown")
-    if battle:
-        wins: dict[str, int] = battle.get("wins", {})
-        if wins:
-            fig = battle_pie_chart(wins)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No battle data available yet.")
+    wins_dict = {r["store"]["name"]: r["wins"] for r in stores_with_wins}
+    col_chart, col_stats = st.columns(2)
+    with col_chart:
+        fig = battle_pie_chart(wins_dict)
+        st.plotly_chart(fig, use_container_width=True)
+    with col_stats:
+        for r in battle_results:
+            store_name = r["store"]["name"]
+            wins = r.get("wins", 0)
+            avg = r.get("avg_price", 0)
+            pct = r.get("cheapest_pct", 0)
+            if wins > 0 or float(avg) > 0:
+                st.markdown(
+                    f"**{store_name}**: {wins} wins ({pct}%) "
+                    f"| avg \u20ac{float(avg):.2f}"
+                )
+    st.divider()
+
+# ---- Product catalogue table ---------------------------------------------
+st.subheader("Product Catalogue")
+
+# Search bar
+search_query = st.text_input(
+    "Search products",
+    placeholder="e.g. milk, bread, chicken ...",
+    key="overview_search",
+)
+
+# Pagination
+if "overview_page" not in st.session_state:
+    st.session_state.overview_page = 1
+
+PAGE_SIZE = 25
+data = _fetch_products(
+    page=st.session_state.overview_page, limit=PAGE_SIZE, search=search_query
+)
+
+items = data.get("items", [])
+total = data.get("total", 0)
+total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+if items:
+    rows = []
+    for p in items:
+        cat = p.get("category")
+        rows.append({
+            "ID": p.get("id"),
+            "Name": p.get("name", ""),
+            "Brand": p.get("brand") or "\u2014",
+            "Category": cat.get("name", "") if cat else "\u2014",
+            "Unit": f"{p['unit_size']} {p['unit']}" if p.get("unit_size") and p.get("unit") else "\u2014",
+            "Image": p.get("image_url") or "",
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Show image column if available
+    has_images = any(r["Image"] for r in rows)
+    if has_images:
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Image": st.column_config.ImageColumn("Image", width="small"),
+                "ID": st.column_config.NumberColumn("ID", width="small"),
+            },
+            height=min(len(rows) * 40 + 50, 700),
+        )
     else:
-        st.info("No battle data available yet.")
+        display_df = df.drop(columns=["Image"])
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-with right_col:
-    st.subheader("Top 5 Biggest Price Differences")
-    top_diffs: list[dict[str, Any]] = stats.get("top_price_differences", [])
-    if top_diffs:
-        for i, item in enumerate(top_diffs[:5], start=1):
-            product_name = item.get("product_name", "Unknown")
-            cheapest = item.get("cheapest_price", 0)
-            most_expensive = item.get("most_expensive_price", 0)
-            diff = most_expensive - cheapest
-            st.markdown(
-                f"**{i}. {product_name}**  \n"
-                f"\u20ac{cheapest:.2f} \u2013 \u20ac{most_expensive:.2f} "
-                f"(diff: **\u20ac{diff:.2f}**)"
-            )
-    else:
-        st.info("No price difference data available yet.")
+    # Pagination controls
+    st.caption(f"Showing {len(items)} of {total} products (page {st.session_state.overview_page}/{total_pages})")
 
-st.divider()
-
-# ---- Recent price changes ------------------------------------------------
-st.subheader("Recent Price Changes")
-recent_changes: list[dict[str, Any]] = stats.get("recent_price_changes", [])
-if recent_changes:
-    import pandas as pd
-
-    df = pd.DataFrame(recent_changes)
-    display_cols = [
-        c
-        for c in ["product_name", "store_name", "old_price", "new_price", "change", "date"]
-        if c in df.columns
-    ]
-    if display_cols:
-        df = df[display_cols]
-
-    # Format currency columns
-    for col in ("old_price", "new_price", "change"):
-        if col in df.columns:
-            df[col] = df[col].apply(lambda v: f"\u20ac{v:.2f}" if v is not None else "")
-
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    nav_cols = st.columns([1, 1, 4])
+    with nav_cols[0]:
+        if st.button("Previous", disabled=st.session_state.overview_page <= 1):
+            st.session_state.overview_page -= 1
+            st.rerun()
+    with nav_cols[1]:
+        if st.button("Next", disabled=st.session_state.overview_page >= total_pages):
+            st.session_state.overview_page += 1
+            st.rerun()
 else:
-    st.info("No recent price changes recorded yet.")
+    if search_query:
+        st.warning("No products found for your search.")
+    else:
+        st.info("No products in the database yet. Run a scraper first!")

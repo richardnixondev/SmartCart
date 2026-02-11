@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 from decimal import Decimal, InvalidOperation
 
 from playwright.async_api import Page, Response
@@ -57,260 +58,215 @@ class TescoScraper(BaseScraper):
     # Scrape a single category
     # ------------------------------------------------------------------
     async def scrape_category(self, category_url: str) -> list[RawProduct]:
-        """Load a Tesco category page, intercept API responses, and parse products."""
-        products: list[RawProduct] = []
-        api_products: list[dict] = []
+        """Load a Tesco category page and extract products via JS evaluation.
 
-        pw, browser, context = await self._get_browser_context(headless=True)
+        Tesco uses Akamai WAF + obfuscated CSS module class names.
+        The most reliable approach is to use JavaScript evaluation to extract
+        product data from the rendered DOM rather than relying on brittle
+        CSS selectors.
+        """
+        # Tesco uses Akamai WAF — resource blocking triggers bot detection
+        pw, browser, context = await self._get_browser_context(
+            headless=True, block_resources=False
+        )
         try:
             page = await context.new_page()
 
-            # Intercept the product listing API response
-            async def _handle_response(response: Response) -> None:
-                url = response.url
-                if "/resources/products/" in url or "/search?" in url:
-                    try:
-                        body = await response.json()
-                        if isinstance(body, dict):
-                            # Tesco returns products under "results" or "productItems"
-                            items = (
-                                body.get("results", [])
-                                or body.get("productItems", [])
-                                or body.get("data", {}).get("results", {}).get("productItems", [])
-                            )
-                            if isinstance(items, list):
-                                api_products.extend(items)
-                    except Exception:
-                        pass
-
-            page.on("response", _handle_response)
-
             logger.info("[tesco] Loading %s", category_url)
-            await page.goto(category_url, wait_until="networkidle", timeout=60_000)
-            await asyncio.sleep(2)
+            await page.goto(category_url, wait_until="domcontentloaded", timeout=60_000)
+            await asyncio.sleep(5)
 
             # Handle cookie consent banner if present
-            try:
-                accept_btn = page.locator("button:has-text('Accept All Cookies')")
-                if await accept_btn.count() > 0:
-                    await accept_btn.first.click()
-                    await asyncio.sleep(1)
-            except Exception:
-                pass
-
-            # Scroll down to trigger lazy-loading of additional products
-            await self._scroll_page(page)
-
-            # Attempt pagination — Tesco uses "Show more" or numbered pages
-            while True:
+            for sel in ["#onetrust-accept-btn-handler", "button:has-text('Accept All')"]:
                 try:
-                    show_more = page.locator(
-                        "a[data-auto='load-more'], "
-                        "button[data-auto='load-more'], "
-                        "a.pagination--page-selector-next"
-                    )
-                    if await show_more.count() > 0 and await show_more.first.is_visible():
-                        await show_more.first.click()
-                        await page.wait_for_load_state("networkidle", timeout=15_000)
-                        await asyncio.sleep(1.5)
-                        await self._scroll_page(page)
-                    else:
+                    btn = page.locator(sel)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.click()
+                        await asyncio.sleep(1)
                         break
                 except Exception:
-                    break
+                    pass
 
-            # --- Parse products from intercepted API data ---
-            if api_products:
-                logger.info("[tesco] Intercepted %d API product items", len(api_products))
-                for item in api_products:
-                    try:
-                        product = self._parse_api_product(item)
-                        if product:
-                            products.append(product)
-                    except Exception:
-                        logger.debug("[tesco] Failed to parse API product item", exc_info=True)
+            await asyncio.sleep(2)
 
-            # --- Fallback: DOM scraping if we got nothing from the API ---
-            if not products:
-                logger.info("[tesco] Falling back to DOM scraping for %s", category_url)
-                products = await self._scrape_dom(page, category_url)
+            # Scroll to load lazy content
+            await self._scroll_page(page, scrolls=6)
+
+            # Extract products using JavaScript evaluation (bypasses CSS obfuscation)
+            products = await self._extract_products_js(page)
+            logger.info("[tesco] Extracted %d products from %s", len(products), category_url)
+
+            return products
 
         finally:
             await context.close()
             await browser.close()
             await pw.stop()
 
-        return products
-
     # ------------------------------------------------------------------
-    # API response parser
+    # JS-based product extraction (reliable against obfuscated CSS)
     # ------------------------------------------------------------------
-    def _parse_api_product(self, item: dict) -> RawProduct | None:
-        """Parse a product dict from Tesco's API response."""
-        # Tesco wraps product data in different shapes depending on the endpoint
-        product_data = item.get("product", item)
+    async def _extract_products_js(self, page: Page) -> list[RawProduct]:
+        """Extract product data via JavaScript evaluation.
 
-        sku = str(product_data.get("id", product_data.get("tpnb", "")))
-        name = product_data.get("title", product_data.get("name", ""))
-        if not sku or not name:
-            return None
+        Tesco uses obfuscated CSS module class names that change every build.
+        Instead of brittle CSS selectors, we find product tiles by structural
+        patterns: the product list ``ul#list-content``, product links matching
+        ``/products/\\d+``, and nearby price elements.
+        """
+        raw_items = await page.evaluate("""() => {
+            const results = [];
+            // The product list container uses id="list-content"
+            const list = document.getElementById('list-content');
+            const tiles = list ? list.querySelectorAll(':scope > li') : [];
 
-        price_str = (
-            product_data.get("price", "")
-            or product_data.get("retailPrice", {}).get("price", "")
-        )
-        try:
-            price = Decimal(str(price_str))
-        except (InvalidOperation, TypeError, ValueError):
-            return None
+            for (const tile of tiles) {
+                try {
+                    // Find the product title link (href contains /products/{id})
+                    const links = tile.querySelectorAll('a[href*="/products/"]');
+                    let name = '';
+                    let href = '';
+                    for (const link of links) {
+                        const text = link.textContent.trim();
+                        if (text && text.length > 2) {
+                            name = text;
+                            href = link.href || link.getAttribute('href') || '';
+                            break;
+                        }
+                    }
+                    if (!name) continue;
 
-        # Promo / clubcard price
-        promo_price = None
-        promo_label = None
-        offer = product_data.get("promotions") or product_data.get("offers") or []
-        if isinstance(offer, list) and offer:
-            first_offer = offer[0] if isinstance(offer[0], dict) else {}
-            promo_label = first_offer.get("offerText", first_offer.get("description"))
-            promo_price_val = first_offer.get("price")
-            if promo_price_val is not None:
-                try:
-                    promo_price = Decimal(str(promo_price_val))
-                except (InvalidOperation, TypeError):
-                    pass
+                    // Extract SKU from href
+                    const skuMatch = href.match(/\\/products\\/(\\d+)/);
+                    const sku = skuMatch ? skuMatch[1] : '';
+                    if (!sku) continue;
 
-        # Unit price
-        unit_price = None
-        unit = None
-        unit_price_raw = product_data.get("unitPrice", product_data.get("unitOfMeasurePrice"))
-        if isinstance(unit_price_raw, dict):
-            try:
-                unit_price = Decimal(str(unit_price_raw.get("price", "")))
-            except (InvalidOperation, TypeError, ValueError):
-                pass
-            unit = unit_price_raw.get("unit", unit_price_raw.get("measure"))
-        elif unit_price_raw is not None:
-            try:
-                unit_price = Decimal(str(unit_price_raw))
-            except (InvalidOperation, TypeError, ValueError):
-                pass
+                    // Find price: look for the main price text (format: €X.XX)
+                    // The price container has ddsweb-price or priceText in class
+                    let priceText = '';
+                    let unitPriceText = '';
+                    const allPs = tile.querySelectorAll('p');
+                    for (const p of allPs) {
+                        const cls = p.className || '';
+                        const text = p.textContent.trim();
+                        if (text.startsWith('€') && !priceText) {
+                            if (text.includes('/')) {
+                                // Unit price like "€0.28/each" or "€1.55/kg"
+                                if (!unitPriceText) unitPriceText = text;
+                            } else {
+                                priceText = text;
+                            }
+                        }
+                    }
 
-        # Unit size from the title  e.g. "Avonmore Milk 2L"
-        unit_size = None
-        size_match = re.search(r"(\d+(?:\.\d+)?)\s*(ml|l|g|kg|cl)\b", name, re.IGNORECASE)
-        if size_match:
-            try:
-                unit_size = Decimal(size_match.group(1))
-                unit = unit or size_match.group(2).lower()
-            except (InvalidOperation, ValueError):
-                pass
+                    // Also check span elements for price
+                    if (!priceText) {
+                        const spans = tile.querySelectorAll('span');
+                        for (const s of spans) {
+                            const text = s.textContent.trim();
+                            if (text.match(/^€\\d/) && !text.includes('/')) {
+                                priceText = text;
+                                break;
+                            }
+                        }
+                    }
 
-        brand = product_data.get("brand", product_data.get("brandName"))
-        ean = product_data.get("ean", product_data.get("gtin"))
-        image_url = product_data.get("defaultImageUrl", product_data.get("imageUrl", ""))
-        if image_url and image_url.startswith("//"):
-            image_url = f"https:{image_url}"
+                    if (!priceText) continue;
 
-        product_url = product_data.get("productUrl", product_data.get("href", ""))
-        if product_url and not product_url.startswith("http"):
-            product_url = f"{BASE_URL}{product_url}"
+                    // Find promo/offer text
+                    let promoLabel = '';
+                    const offerEl = tile.querySelector('[data-auto="offer-text"]');
+                    if (offerEl) {
+                        promoLabel = offerEl.textContent.trim();
+                    }
+                    // Also check for Aldi Price Match or Clubcard badges
+                    if (!promoLabel) {
+                        const badges = tile.querySelectorAll('span[class*="logo"], span[class*="promo"], span[class*="offer"]');
+                        for (const b of badges) {
+                            const t = b.textContent.trim();
+                            if (t && t.length > 2 && t.length < 80) {
+                                promoLabel = t;
+                                break;
+                            }
+                        }
+                    }
 
-        in_stock = product_data.get("isAvailable", product_data.get("status", "")) != "OutOfStock"
-        if isinstance(in_stock, str):
-            in_stock = in_stock.lower() not in ("false", "outofstock", "unavailable")
+                    // Find image
+                    let imageUrl = '';
+                    const img = tile.querySelector('img');
+                    if (img) {
+                        imageUrl = img.src || img.getAttribute('data-src') || '';
+                    }
 
-        return RawProduct(
-            store_sku=sku,
-            name=name.strip(),
-            price=price,
-            promo_price=promo_price,
-            promo_label=promo_label,
-            unit_price=unit_price,
-            unit=unit,
-            unit_size=unit_size,
-            brand=brand,
-            ean=str(ean) if ean else None,
-            image_url=image_url or None,
-            product_url=product_url or None,
-            in_stock=bool(in_stock),
-        )
+                    results.push({
+                        sku: sku,
+                        name: name,
+                        price: priceText,
+                        unitPrice: unitPriceText,
+                        promoLabel: promoLabel,
+                        imageUrl: imageUrl,
+                        href: href,
+                    });
+                } catch (e) {
+                    // skip tile
+                }
+            }
+            return results;
+        }""")
 
-    # ------------------------------------------------------------------
-    # DOM fallback
-    # ------------------------------------------------------------------
-    async def _scrape_dom(self, page: Page, category_url: str) -> list[RawProduct]:
-        """Scrape product data directly from the rendered DOM."""
         products: list[RawProduct] = []
-
-        # Tesco uses product tiles in the category listing
-        product_tiles = page.locator(
-            "li[class*='product-list--list-item'], "
-            "div[data-auto='product-tile'], "
-            "div[class*='product-tile-wrapper']"
-        )
-        count = await product_tiles.count()
-        logger.info("[tesco] Found %d product tiles in DOM", count)
-
-        for i in range(count):
+        for item in raw_items:
             try:
-                tile = product_tiles.nth(i)
-
-                # Product name / link
-                name_el = tile.locator(
-                    "a[data-auto='product-tile--title'], "
-                    "a[class*='product-tile--title'], "
-                    "h3 a, "
-                    "a.product-title"
-                )
-                name = (await name_el.first.inner_text()).strip() if await name_el.count() > 0 else ""
-                href = await name_el.first.get_attribute("href") if await name_el.count() > 0 else ""
-                if not name:
+                name = item.get("name", "").strip()
+                sku = item.get("sku", "")
+                if not name or not sku:
                     continue
 
-                # SKU from href  e.g. /groceries/en-IE/products/123456789
-                sku = ""
-                if href:
-                    sku_match = re.search(r"/products/(\d+)", href)
-                    sku = sku_match.group(1) if sku_match else ""
-                if not sku:
-                    sku = f"tesco-{i}-{hash(name) % 100000}"
-
-                # Price
-                price_el = tile.locator(
-                    "span[data-auto='price-value'], "
-                    "p[class*='price-per-sellable-unit'], "
-                    "span.value"
-                )
-                price_text = ""
-                if await price_el.count() > 0:
-                    price_text = await price_el.first.inner_text()
-                price_text = re.sub(r"[^\d.]", "", price_text)
+                # Parse price
+                price_text = re.sub(r"[^\d.]", "", item.get("price", ""))
                 try:
-                    price = Decimal(price_text) if price_text else Decimal("0")
+                    price = Decimal(price_text) if price_text else None
                 except InvalidOperation:
-                    price = Decimal("0")
-
-                if price == 0:
+                    price = None
+                if not price or price == 0:
                     continue
+
+                # Parse unit price
+                unit_price = None
+                unit = None
+                up_text = item.get("unitPrice", "")
+                if up_text:
+                    up_match = re.search(r"€([\d.]+)/([\w]+)", up_text)
+                    if up_match:
+                        try:
+                            unit_price = Decimal(up_match.group(1))
+                            unit = up_match.group(2).lower()
+                        except (InvalidOperation, ValueError):
+                            pass
+
+                # Unit size from name
+                unit_size = None
+                size_match = re.search(
+                    r"(\d+(?:\.\d+)?)\s*(ml|l|g|kg|cl|pk|pack)\b", name, re.IGNORECASE
+                )
+                if size_match:
+                    try:
+                        unit_size = Decimal(size_match.group(1))
+                        unit = unit or size_match.group(2).lower()
+                    except (InvalidOperation, ValueError):
+                        pass
 
                 # Promo
-                promo_label = None
-                promo_el = tile.locator(
-                    "span[data-auto='offer-text'], "
-                    "div[class*='offer-text'], "
-                    "span[class*='promo-content-small']"
-                )
-                if await promo_el.count() > 0:
-                    promo_label = (await promo_el.first.inner_text()).strip() or None
+                promo_label = item.get("promoLabel") or None
 
                 # Image
-                img_el = tile.locator("img")
-                image_url = None
-                if await img_el.count() > 0:
-                    image_url = await img_el.first.get_attribute("src")
-                    if image_url and image_url.startswith("//"):
-                        image_url = f"https:{image_url}"
+                image_url = item.get("imageUrl") or None
+                if image_url and image_url.startswith("//"):
+                    image_url = f"https:{image_url}"
 
-                product_url = f"{BASE_URL}{href}" if href and not href.startswith("http") else href
+                # Product URL
+                href = item.get("href", "")
+                product_url = href if href.startswith("http") else f"{BASE_URL}{href}" if href else None
 
                 products.append(
                     RawProduct(
@@ -318,12 +274,15 @@ class TescoScraper(BaseScraper):
                         name=name,
                         price=price,
                         promo_label=promo_label,
+                        unit_price=unit_price,
+                        unit=unit,
+                        unit_size=unit_size,
                         image_url=image_url,
-                        product_url=product_url or None,
+                        product_url=product_url,
                     )
                 )
             except Exception:
-                logger.debug("[tesco] Failed to parse tile %d", i, exc_info=True)
+                logger.debug("[tesco] Failed to parse JS-extracted product", exc_info=True)
 
         return products
 
@@ -346,14 +305,37 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s - %(message)s",
     )
-    scraper = TescoScraper()
-    result = await scraper.run()
-    print(f"\nDone: {result.status}")
-    print(f"Products scraped: {len(result.products)}")
-    if result.errors:
-        print(f"Errors ({len(result.errors)}):")
-        for err in result.errors:
-            print(f"  - {err}")
+
+    dry_run = "--dry-run" in sys.argv
+
+    if dry_run:
+        # Dry-run mode: scrape categories and print products without hitting the DB
+        scraper = TescoScraper()
+        category_urls = await scraper.get_category_urls()
+        all_products: list[RawProduct] = []
+        for url in category_urls:
+            try:
+                products = await scraper.scrape_category(url)
+                all_products.extend(products)
+                print(f"[dry-run] {url} -> {len(products)} products")
+            except Exception as exc:
+                print(f"[dry-run] {url} -> ERROR: {exc}")
+            await random_delay(1.0, 3.0)
+
+        print(f"\n[dry-run] Total products scraped: {len(all_products)}")
+        for p in all_products[:20]:
+            print(f"  {p.store_sku:>12s}  {str(p.price):>8s}  {p.name}")
+        if len(all_products) > 20:
+            print(f"  ... and {len(all_products) - 20} more")
+    else:
+        scraper = TescoScraper()
+        result = await scraper.run()
+        print(f"\nDone: {result.status}")
+        print(f"Products scraped: {len(result.products)}")
+        if result.errors:
+            print(f"Errors ({len(result.errors)}):")
+            for err in result.errors:
+                print(f"  - {err}")
 
 
 if __name__ == "__main__":

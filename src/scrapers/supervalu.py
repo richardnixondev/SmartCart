@@ -3,6 +3,10 @@
 SuperValu requires authentication to browse the full catalogue.  We use
 Playwright to log in with the credentials from settings and then browse
 each category.
+
+IMPORTANT: Login URL is at supervalu.ie/login/ (NOT shop.supervalu.ie/login).
+Category URLs use the format /categories/{slug}-id-{code}.
+After login, a store must be selected before browsing products.
 """
 
 from __future__ import annotations
@@ -24,24 +28,14 @@ from src.scrapers.base import (
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://shop.supervalu.ie"
-LOGIN_URL = f"{BASE_URL}/login"
+LOGIN_URL = "https://supervalu.ie/login/"
 
-# SuperValu grocery categories
+# Confirmed SuperValu category paths (format: /categories/{slug}-id-{code})
 CATEGORY_PATHS = [
-    "/shopping/fresh/",
-    "/shopping/bakery/",
-    "/shopping/dairy-eggs-chilled/",
-    "/shopping/meat-poultry-fish/",
-    "/shopping/fruit-vegetables/",
-    "/shopping/frozen/",
-    "/shopping/drinks/",
-    "/shopping/food-cupboard/",
-    "/shopping/snacks-confectionery/",
-    "/shopping/household/",
-    "/shopping/health-beauty/",
-    "/shopping/baby-toddler/",
-    "/shopping/pet-care/",
-    "/shopping/alcohol/",
+    "/categories/fruit-vegetables-id-O100001",
+    "/categories/meat-%26-poultry-id-O100015",
+    "/categories/chilled-food-id-O100030",
+    "/categories/frozen-foods-id-O100045",
 ]
 
 
@@ -61,7 +55,54 @@ class SuperValuScraper(BaseScraper):
     # Category URLs
     # ------------------------------------------------------------------
     async def get_category_urls(self) -> list[str]:
+        """Return category URLs, preferring dynamic discovery.
+
+        Falls back to the static seed list if discovery finds nothing.
+        """
+        discovered = await self._discover_categories()
+        if discovered:
+            logger.info(
+                "[supervalu] Discovered %d category URLs from allaisles", len(discovered)
+            )
+            return discovered
+
+        logger.warning("[supervalu] Category discovery found nothing; using static seed list")
         return [f"{BASE_URL}{path}" for path in CATEGORY_PATHS]
+
+    async def _discover_categories(self) -> list[str]:
+        """Discover category URLs from /shopping/allaisles."""
+        pw, browser, context = await self._get_browser_context(headless=True)
+        try:
+            page = await context.new_page()
+
+            # Must log in first to access the catalogue
+            await self._login(page)
+            await self._select_store(page)
+            await random_delay(1.0, 2.0)
+
+            logger.info("[supervalu] Discovering categories from allaisles page")
+            await page.goto(
+                f"{BASE_URL}/shopping/allaisles",
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            await asyncio.sleep(3)
+
+            links = await page.evaluate('''() => {
+                return [...document.querySelectorAll('a[href*="/categories/"]')]
+                    .map(a => a.href)
+                    .filter(href => href.includes('-id-'));
+            }''')
+            unique = list(set(links))
+            return unique
+
+        except Exception:
+            logger.warning("[supervalu] Category discovery failed", exc_info=True)
+            return []
+        finally:
+            await context.close()
+            await browser.close()
+            await pw.stop()
 
     # ------------------------------------------------------------------
     # Scrape one category
@@ -76,6 +117,10 @@ class SuperValuScraper(BaseScraper):
             # Authenticate
             await self._login(page)
             await random_delay(1.0, 2.0)
+
+            # Select a store (required before browsing products)
+            await self._select_store(page)
+            await random_delay(0.5, 1.0)
 
             # Navigate to category
             logger.info("[supervalu] Loading category %s", category_url)
@@ -181,6 +226,64 @@ class SuperValuScraper(BaseScraper):
             logger.warning("[supervalu] Still on login page after submission — login may have failed")
         else:
             logger.info("[supervalu] Login appears successful (now at %s)", page.url)
+
+    async def _select_store(self, page: Page) -> None:
+        """After login, select a store by navigating to allaisles or entering Eircode.
+
+        SuperValu requires a store/delivery area to be selected before
+        product prices and availability are shown.
+        """
+        try:
+            # First check if we're already on a page that has store selected
+            # (i.e., products are visible)
+            product_check = page.locator("[class*='ProductCard'], [class*='product-card']")
+            if await product_check.count() > 0:
+                logger.debug("[supervalu] Store appears already selected")
+                return
+
+            # Look for Eircode / postcode input (store selection modal or page)
+            eircode_input = page.locator(
+                "input[placeholder*='Eircode' i], "
+                "input[name*='eircode' i], "
+                "input[placeholder*='postcode' i], "
+                "input[placeholder*='Enter your area' i], "
+                "input[id*='eircode' i], "
+                "input[id*='postcode' i]"
+            )
+            if await eircode_input.count() > 0:
+                logger.info("[supervalu] Found Eircode input, entering D01 F5P2")
+                await eircode_input.first.fill("D01 F5P2")  # Dublin city center
+                await asyncio.sleep(1)
+
+                # Click search/submit button
+                submit = page.locator(
+                    "button[type='submit'], "
+                    "button:has-text('Find'), "
+                    "button:has-text('Search'), "
+                    "button:has-text('Go'), "
+                    "button[aria-label*='search' i]"
+                )
+                if await submit.count() > 0:
+                    await submit.first.click()
+                    await asyncio.sleep(2)
+
+                    # If a store list appears, pick the first one
+                    store_option = page.locator(
+                        "button:has-text('Select'), "
+                        "a:has-text('Select Store'), "
+                        "button:has-text('Choose'), "
+                        "li[class*='store'] button, "
+                        "div[class*='store-item'] button"
+                    )
+                    if await store_option.count() > 0:
+                        await store_option.first.click()
+                        await asyncio.sleep(2)
+                        logger.info("[supervalu] Store selected via Eircode search")
+            else:
+                logger.debug("[supervalu] No Eircode input found; store may already be set")
+
+        except Exception:
+            logger.debug("[supervalu] Store selection handling failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # DOM extraction

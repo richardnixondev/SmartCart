@@ -6,13 +6,20 @@ from typing import Any
 
 import httpx
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.core.config import settings
-from src.dashboard.components.charts import battle_pie_chart
+from src.dashboard.components.charts import STORE_COLOURS, battle_pie_chart
 from src.dashboard.components.filters import category_filter
 
 API = settings.api_base_url
+
+POPULAR_SEARCHES = [
+    "milk", "bread", "chicken", "rice", "butter", "cheese",
+    "eggs", "pasta", "sugar", "tea", "coffee", "water",
+    "beef", "salmon", "yoghurt", "cereal", "oil", "flour",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -31,108 +38,171 @@ def _fetch_battle(category_id: int | None = None) -> dict[str, Any]:
         return {}
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _search_prices(query: str) -> list[dict[str, Any]]:
+    if not query:
+        return []
+    try:
+        resp = httpx.get(
+            f"{API}/api/search-prices",
+            params={"q": query, "limit": 60},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Page content
 # ---------------------------------------------------------------------------
-st.title("\u2694\ufe0f Price Battle")
-st.caption("See which store offers the cheapest price for every product.")
+st.title("Price Battle")
+st.caption("Compare real product prices across Irish supermarkets.")
 
-# ---- Filters -------------------------------------------------------------
-with st.sidebar:
-    st.subheader("Filters")
-    selected_category = category_filter(key="battle_category")
+# ---- Store Rankings (compact) --------------------------------------------
+battle = _fetch_battle()
+results = battle.get("results", [])
+stores_with_data = [r for r in results if float(r.get("avg_price", 0)) > 0]
 
-# ---- Fetch data ----------------------------------------------------------
-battle = _fetch_battle(category_id=selected_category)
+if stores_with_data:
+    st.subheader("Store Overview")
+    metric_cols = st.columns(len(stores_with_data))
+    for idx, r in enumerate(stores_with_data):
+        store_name = r["store"]["name"]
+        avg_price = float(r.get("avg_price", 0))
+        product_count = r.get("wins", 0)
+        metric_cols[idx].metric(
+            label=store_name,
+            value=f"\u20ac{avg_price:.2f} avg",
+        )
+    st.divider()
 
-if not battle:
-    st.error(
-        "Unable to load battle data. Please make sure the API is running "
-        f"at **{API}**."
-    )
-    st.stop()
+# ---- Product Price Comparison --------------------------------------------
+st.subheader("Compare Products")
 
-# ---- Summary statistics --------------------------------------------------
-products: list[dict[str, Any]] = battle.get("products", [])
-wins: dict[str, int] = battle.get("wins", {})
-store_names: list[str] = battle.get("stores", [])
+# Popular search buttons
+st.caption("Popular searches:")
+button_cols = st.columns(9)
+for idx, term in enumerate(POPULAR_SEARCHES[:9]):
+    with button_cols[idx]:
+        if st.button(term.capitalize(), key=f"pop_{term}", use_container_width=True):
+            st.session_state.battle_search_input = term
+            st.rerun()
 
-if not products:
-    st.info("No products found for the selected category.")
-    st.stop()
+# Second row of popular searches
+button_cols2 = st.columns(9)
+for idx, term in enumerate(POPULAR_SEARCHES[9:18]):
+    with button_cols2[idx]:
+        if st.button(term.capitalize(), key=f"pop_{term}", use_container_width=True):
+            st.session_state.battle_search_input = term
+            st.rerun()
 
-st.subheader("Summary")
-summary_cols = st.columns(len(wins) if wins else 1)
-for idx, (store, count) in enumerate(sorted(wins.items(), key=lambda x: -x[1])):
-    summary_cols[idx % len(summary_cols)].metric(
-        label=store,
-        value=f"{count} wins",
-    )
+# Search input
+actual_query = st.text_input(
+    "Search for a product to compare prices",
+    placeholder="e.g. milk, bread, chicken ...",
+    key="battle_search_input",
+)
 
-st.divider()
+if actual_query:
+    results_data = _search_prices(actual_query)
 
-# ---- Pie chart + table side by side --------------------------------------
-chart_col, table_col = st.columns([1, 2])
+    if not results_data:
+        st.warning(f"No products found for '{actual_query}'.")
+    else:
+        # Build comparison table
+        rows = []
+        for item in results_data:
+            price = item["price"]
+            promo = item.get("promo_price")
+            effective = item["effective_price"]
 
-with chart_col:
-    if wins:
-        fig = battle_pie_chart(wins)
+            row = {
+                "Store": item["store"],
+                "Product": item["product_name"],
+                "Price": price,
+                "Effective": effective,
+                "Promo": item.get("promo_label") or "",
+            }
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+
+        # Sort by effective price
+        df = df.sort_values("Effective")
+
+        # Show count per store
+        store_counts = df["Store"].value_counts()
+        st.caption(
+            f"Found {len(df)} products matching '{actual_query}': "
+            + ", ".join(f"{store} ({count})" for store, count in store_counts.items())
+        )
+
+        # Format for display
+        display_df = df.copy()
+        display_df["Price"] = display_df["Price"].apply(lambda p: f"\u20ac{p:.2f}")
+        display_df["Effective"] = display_df["Effective"].apply(lambda p: f"\u20ac{p:.2f}")
+
+        # Color-code by store
+        def _style_store(row: pd.Series) -> list[str]:
+            store = row.get("Store", "")
+            color = STORE_COLOURS.get(store, "")
+            # Match partial store names
+            for key, val in STORE_COLOURS.items():
+                if key.lower() in store.lower():
+                    color = val
+                    break
+            if color:
+                return [f"border-left: 4px solid {color}"] + [""] * (len(row) - 1)
+            return [""] * len(row)
+
+        styled = display_df.style.apply(_style_store, axis=1)
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            hide_index=True,
+            height=min(len(display_df) * 38 + 50, 600),
+        )
+
+        # Average price chart per store for this search
+        st.subheader(f"Average price for '{actual_query}' by store")
+        avg_by_store = df.groupby("Store")["Effective"].mean().sort_values()
+
+        colors = []
+        for store in avg_by_store.index:
+            color = "#888888"
+            for key, val in STORE_COLOURS.items():
+                if key.lower() in store.lower():
+                    color = val
+                    break
+            colors.append(color)
+
+        fig = go.Figure(
+            go.Bar(
+                x=avg_by_store.index,
+                y=avg_by_store.values,
+                marker_color=colors,
+                text=[f"\u20ac{v:.2f}" for v in avg_by_store.values],
+                textposition="outside",
+            )
+        )
+        fig.update_layout(
+            yaxis_title="Average Price (\u20ac)",
+            yaxis_tickprefix="\u20ac",
+            margin=dict(l=40, r=20, t=20, b=40),
+            template="plotly_white",
+            height=350,
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-with table_col:
-    st.subheader("Product Comparison Table")
-
-    # Build a DataFrame: Product | Store1 | Store2 | ... | Cheapest
-    rows: list[dict[str, Any]] = []
-    for prod in products:
-        row: dict[str, Any] = {"Product": prod.get("product_name", "Unknown")}
-        prices: dict[str, float | None] = prod.get("prices", {})
-        valid_prices: dict[str, float] = {}
-        for store in store_names:
-            price = prices.get(store)
-            row[store] = f"\u20ac{price:.2f}" if price is not None else "\u2014"
-            if price is not None:
-                valid_prices[store] = price
-        if valid_prices:
-            cheapest_store = min(valid_prices, key=valid_prices.get)  # type: ignore[arg-type]
-            row["Cheapest"] = cheapest_store
-        else:
-            row["Cheapest"] = "\u2014"
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-
-    # ---------------------------------------------------------------------------
-    # Highlight the cheapest price cell per row in green
-    # ---------------------------------------------------------------------------
-    def _highlight_cheapest(row: pd.Series) -> list[str]:
-        """Return a list of CSS styles, highlighting the cheapest store cell."""
-        styles = [""] * len(row)
-        cheapest = row.get("Cheapest", "\u2014")
-        if cheapest == "\u2014":
-            return styles
-        for i, col in enumerate(row.index):
-            if col == cheapest:
-                styles[i] = "background-color: #d4edda; font-weight: bold;"
-        return styles
-
-    styled = df.style.apply(_highlight_cheapest, axis=1)
-    st.dataframe(styled, use_container_width=True, hide_index=True, height=500)
-
-st.divider()
-
-# ---- Detailed stats -------------------------------------------------------
-st.subheader("Detailed Statistics")
-if wins:
-    total_products = len(products)
-    stats_rows = []
-    for store, count in sorted(wins.items(), key=lambda x: -x[1]):
-        pct = (count / total_products * 100) if total_products else 0
-        stats_rows.append(
-            {"Store": store, "Wins": count, "Win %": f"{pct:.1f}%"}
-        )
-    st.dataframe(
-        pd.DataFrame(stats_rows),
-        use_container_width=True,
-        hide_index=True,
-    )
+        # Cheapest finds
+        st.subheader("Best Deals")
+        cheapest = df.nsmallest(5, "Effective")
+        for _, row in cheapest.iterrows():
+            promo_text = f" ({row['Promo']})" if row["Promo"] else ""
+            st.markdown(
+                f"**\u20ac{row['Effective']:.2f}** - {row['Product']} @ {row['Store']}{promo_text}"
+            )
+else:
+    st.info("Search for a product above or click a popular category to compare prices across stores.")

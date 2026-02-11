@@ -40,8 +40,8 @@ def _compare_basket(items: list[dict[str, Any]]) -> dict[str, Any]:
     """POST the basket to the API and return comparison results."""
     try:
         resp = httpx.post(
-            f"{API}/api/baskets/compare",
-            json={"items": items},
+            f"{API}/api/baskets",
+            json={"name": "My Basket", "items": items},
             timeout=15,
         )
         resp.raise_for_status()
@@ -61,7 +61,7 @@ if "basket_items" not in st.session_state:
 # ---------------------------------------------------------------------------
 # Page content
 # ---------------------------------------------------------------------------
-st.title("\U0001f6d2 Basket Compare")
+st.title("Basket Compare")
 st.caption(
     "Build a shopping list, then compare the total cost at each store."
 )
@@ -119,7 +119,7 @@ st.subheader("Your Basket")
 if not st.session_state.basket_items:
     st.info("Your basket is empty. Search and add products above.")
 else:
-    # Show basket as an editable table
+    # Show basket as a table
     basket_df = pd.DataFrame(
         [
             {
@@ -175,78 +175,45 @@ else:
         st.divider()
         st.subheader("Comparison Results")
 
-        # ---- Totals per store --------------------------------------------
-        store_totals: list[dict[str, Any]] = result.get("store_totals", [])
+        # ---- Totals per store (from BasketCompareOut.stores) ------
+        store_totals: list[dict[str, Any]] = result.get("stores", [])
         if store_totals:
-            # Sort cheapest first
-            store_totals_sorted = sorted(store_totals, key=lambda s: s.get("total", float("inf")))
+            # Filter out stores with 0 items found
+            active_stores = [s for s in store_totals if s.get("items_found", 0) > 0]
+            if not active_stores:
+                st.warning("None of the stores carry these products.")
+            else:
+                # Sort cheapest first
+                active_sorted = sorted(active_stores, key=lambda s: float(s.get("total", 99999)))
 
-            # Metrics row
-            metric_cols = st.columns(len(store_totals_sorted))
-            cheapest_total = store_totals_sorted[0]["total"] if store_totals_sorted else 0
-            for idx, st_total in enumerate(store_totals_sorted):
-                name = st_total.get("store_name", "Unknown")
-                total = st_total.get("total", 0)
-                delta = total - cheapest_total
-                metric_cols[idx].metric(
-                    label=name,
-                    value=f"\u20ac{total:.2f}",
-                    delta=f"+\u20ac{delta:.2f}" if delta > 0 else "Cheapest",
-                    delta_color="inverse" if delta > 0 else "off",
-                )
+                # Metrics row
+                metric_cols = st.columns(len(active_sorted))
+                cheapest_total = float(active_sorted[0]["total"]) if active_sorted else 0
+                for idx, st_total in enumerate(active_sorted):
+                    store_info = st_total.get("store", {})
+                    name = store_info.get("name", "Unknown")
+                    total = float(st_total.get("total", 0))
+                    found = st_total.get("items_found", 0)
+                    missing = st_total.get("items_missing", 0)
+                    delta = total - cheapest_total
 
-            # Bar chart
-            chart_data = [
-                {"store_name": s["store_name"], "total": s["total"]}
-                for s in store_totals_sorted
-            ]
-            fig = basket_comparison_bar(chart_data)
-            st.plotly_chart(fig, use_container_width=True)
-
-        # ---- Item breakdown per store ------------------------------------
-        breakdown: list[dict[str, Any]] = result.get("breakdown", [])
-        if breakdown:
-            st.divider()
-            st.subheader("Item Breakdown")
-
-            rows: list[dict[str, Any]] = []
-            for entry in breakdown:
-                row: dict[str, Any] = {
-                    "Product": entry.get("product_name", "Unknown"),
-                    "Qty": entry.get("quantity", 1),
-                }
-                prices = entry.get("prices", {})
-                for store_name, price in prices.items():
-                    row[store_name] = (
-                        f"\u20ac{price:.2f}" if price is not None else "\u2014"
+                    metric_cols[idx].metric(
+                        label=name,
+                        value=f"\u20ac{total:.2f}",
+                        delta=f"+\u20ac{delta:.2f}" if delta > 0 else "Cheapest",
+                        delta_color="inverse" if delta > 0 else "off",
                     )
-                rows.append(row)
+                    metric_cols[idx].caption(f"{found} found, {missing} missing")
 
-            breakdown_df = pd.DataFrame(rows)
-
-            # Highlight cheapest per row
-            store_cols = [
-                c for c in breakdown_df.columns if c not in ("Product", "Qty")
-            ]
-
-            def _highlight_row(row: pd.Series) -> list[str]:
-                styles = [""] * len(row)
-                min_val = float("inf")
-                min_idx = -1
-                for i, col in enumerate(row.index):
-                    if col in store_cols:
-                        val_str = row[col]
-                        if val_str and val_str != "\u2014":
-                            try:
-                                val = float(val_str.replace("\u20ac", ""))
-                                if val < min_val:
-                                    min_val = val
-                                    min_idx = i
-                            except ValueError:
-                                pass
-                if min_idx >= 0:
-                    styles[min_idx] = "background-color: #d4edda; font-weight: bold;"
-                return styles
-
-            styled = breakdown_df.style.apply(_highlight_row, axis=1)
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+                # Bar chart
+                chart_data = [
+                    {
+                        "store_name": s["store"]["name"],
+                        "total": float(s["total"]),
+                    }
+                    for s in active_sorted
+                ]
+                fig = basket_comparison_bar(chart_data)
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No store comparison data available.")
