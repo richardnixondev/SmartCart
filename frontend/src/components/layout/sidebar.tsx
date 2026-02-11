@@ -9,6 +9,7 @@ import {
   Swords,
   TrendingUp,
   ShoppingCart,
+  Settings,
   Menu,
   X,
 } from "lucide-react";
@@ -19,6 +20,7 @@ const NAV_ITEMS = [
   { href: "/price-battle", icon: <Swords className="h-4 w-4" />, label: "Price Battle" },
   { href: "/product-history", icon: <TrendingUp className="h-4 w-4" />, label: "Product History" },
   { href: "/basket-compare", icon: <ShoppingCart className="h-4 w-4" />, label: "Basket Compare" },
+  { href: "/admin", icon: <Settings className="h-4 w-4" />, label: "Product Admin" },
 ];
 
 export function Sidebar() {

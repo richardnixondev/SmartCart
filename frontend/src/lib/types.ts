@@ -134,3 +134,60 @@ export interface SearchPriceResult {
   image_url: string | null;
   product_url: string | null;
 }
+
+// ──────────────────────────── Admin ─────────────────────────────────────────
+
+export interface AdminStoreProductOut {
+  id: number;
+  store: StoreOut;
+  store_sku: string | null;
+  store_name: string;
+  store_url: string | null;
+  is_active: boolean;
+  latest_price: number | null;
+  promo_price: number | null;
+}
+
+export interface AdminProductOut {
+  id: number;
+  name: string;
+  brand: string | null;
+  ean: string | null;
+  category: CategoryOut | null;
+  unit: string | null;
+  unit_size: number | null;
+  image_url: string | null;
+  store_product_count: number;
+  store_products: AdminStoreProductOut[];
+}
+
+export interface AdminProductListOut {
+  items: AdminProductOut[];
+  total: number;
+}
+
+export interface ProductUpdateIn {
+  name?: string;
+  brand?: string | null;
+  ean?: string | null;
+  unit?: string | null;
+  unit_size?: number | null;
+  image_url?: string | null;
+  category_id?: number | null;
+}
+
+export interface MergeProductsIn {
+  product_ids: number[];
+  target_id?: number;
+}
+
+export interface MergeProductsOut {
+  kept_product_id: number;
+  merged_product_ids: number[];
+  store_products_moved: number;
+}
+
+export interface UnlinkOut {
+  new_product_id: number;
+  store_product_id: number;
+}

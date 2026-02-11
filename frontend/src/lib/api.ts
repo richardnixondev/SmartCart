@@ -1,14 +1,21 @@
 import type {
+  AdminProductListOut,
+  AdminProductOut,
+  AdminStoreProductOut,
   BasketCompareOut,
   BasketIn,
   BattleOut,
   CategoryOut,
   ComparisonOut,
+  MergeProductsIn,
+  MergeProductsOut,
   PriceHistoryOut,
   ProductListOut,
+  ProductUpdateIn,
   SearchPriceResult,
   StatsOut,
   StoreOut,
+  UnlinkOut,
 } from "./types";
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "";
@@ -86,4 +93,49 @@ export function compareBasket(basket: BasketIn) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(basket),
   });
+}
+
+// ──────────────────────────── Admin ─────────────────────────────────────────
+
+export function fetchUnmatched(params: {
+  search?: string;
+  store_id?: number;
+  page?: number;
+  limit?: number;
+}) {
+  const sp = new URLSearchParams();
+  if (params.search) sp.set("search", params.search);
+  if (params.store_id) sp.set("store_id", String(params.store_id));
+  if (params.page) sp.set("page", String(params.page));
+  if (params.limit) sp.set("limit", String(params.limit));
+  return fetchApi<AdminProductListOut>(`/api/admin/unmatched?${sp.toString()}`);
+}
+
+export function fetchAdminStoreProducts(productId: number) {
+  return fetchApi<AdminStoreProductOut[]>(
+    `/api/admin/products/${productId}/store-products`
+  );
+}
+
+export function updateProduct(productId: number, data: ProductUpdateIn) {
+  return fetchApi<AdminProductOut>(`/api/admin/products/${productId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export function mergeProducts(data: MergeProductsIn) {
+  return fetchApi<MergeProductsOut>("/api/admin/products/merge", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export function unlinkStoreProduct(productId: number, storeProductId: number) {
+  return fetchApi<UnlinkOut>(
+    `/api/admin/products/${productId}/unlink/${storeProductId}`,
+    { method: "POST" }
+  );
 }

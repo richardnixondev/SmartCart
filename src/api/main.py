@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
-from src.api.routers import baskets, comparison, prices, products
+from src.api.routers import admin, baskets, comparison, prices, products
 
 app = FastAPI(
     title="SmartCart API",
@@ -30,6 +30,7 @@ app.include_router(products.router)
 app.include_router(prices.router)
 app.include_router(comparison.router)
 app.include_router(baskets.router)
+app.include_router(admin.router)
 
 
 # ---------------------------------------------------------------------------

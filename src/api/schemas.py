@@ -142,3 +142,61 @@ class StatsOut(BaseModel):
     total_price_records: int
     last_scrape: datetime | None = None
     avg_prices_by_store: list[AvgPriceByStore]
+
+
+# ──────────────────────────── Admin ──────────────────────────────────────────
+
+
+class AdminStoreProductOut(BaseModel):
+    id: int
+    store: StoreOut
+    store_sku: str | None = None
+    store_name: str
+    store_url: str | None = None
+    is_active: bool
+    latest_price: Decimal | None = None
+    promo_price: Decimal | None = None
+
+
+class AdminProductOut(BaseModel):
+    id: int
+    name: str
+    brand: str | None = None
+    ean: str | None = None
+    category: CategoryOut | None = None
+    unit: str | None = None
+    unit_size: Decimal | None = None
+    image_url: str | None = None
+    store_product_count: int
+    store_products: list[AdminStoreProductOut] = []
+
+
+class AdminProductListOut(BaseModel):
+    items: list[AdminProductOut]
+    total: int
+
+
+class ProductUpdateIn(BaseModel):
+    name: str | None = None
+    brand: str | None = None
+    ean: str | None = None
+    unit: str | None = None
+    unit_size: Decimal | None = None
+    image_url: str | None = None
+    category_id: int | None = None
+
+
+class MergeProductsIn(BaseModel):
+    product_ids: list[int]
+    target_id: int | None = None
+
+
+class MergeProductsOut(BaseModel):
+    kept_product_id: int
+    merged_product_ids: list[int]
+    store_products_moved: int
+
+
+class UnlinkOut(BaseModel):
+    new_product_id: int
+    store_product_id: int
